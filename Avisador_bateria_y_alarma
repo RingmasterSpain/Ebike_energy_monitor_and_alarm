@@ -1,0 +1,398 @@
+/*  ==================================================================
+
+  Sketch control de batería, pensado para su funcionamiento en un Attiny85
+  Activa un LED RGB según el voltaje y tipo batería (Divisor voltaje)
+  Morado sobrecarga, azul 90-100%, verde 50-90%, amarillo del 30 al 40%,
+  naranja del 20 al 30%, rojo 10 al 20% y rojo parpadeante por debajo del 10%
+  
+  Autor: David Losada, basado en trabajos previos de otros autores:
+  Parte de código de la referencia rápida del Digispark: http://digistump.com/wiki/digispark/quickref
+    
+  Version: 0.5 bajo licencia GPLv3
+  Fecha: octubre 2016
+
+  Includes NeoPixel Ring simple sketch code from (c) 2013 Shae Erisson
+  released under the GPLv3 license to match the rest of the AdaFruit NeoPixel library
+  
+  ==================================================================   */
+
+//#include <EEPROMex.h> //La librería Neopixel ocupa demasiado en el ATtiny; anulo toda la parte de guardado de datos estadísticos
+#include <Adafruit_NeoPixel.h> //Para el control del led
+
+//from https://bigdanzblog.wordpress.com/2014/08/10/attiny85-wake-from-sleep-on-pin-state-change-code-example/
+#include <avr/sleep.h>   
+#include <avr/interrupt.h>  //creo que al final no se usa, pero mejor dejarla (el compilador no la incluye si no se usa, por lo que no ocupa)
+
+//******************* A CAMBIAR SEGÚN TU CONFIGURACIÓN ********************************
+
+//Relación de voltaje y estado de carga de la batería; se puede agregar para cualquier tipo de batería, siempre teniendo en cuenta que estaremos comprobando sólo una celda de hasta 5V
+//por lo que es imprescindible utilizar un BMS de equilibrado de celdas en la carga para evitar problemas con las celdas no monitorizadas
+//Descomentamos el tipo de batería que queramos utilizar
+//(VALORES %: 1%,8%,20%,30%,40%,90%,100%)
+const double mVoltCarga[7]={2.8,3.10,3.17,3.198,3.22,3.4,3.6}; //tabla de relación de voltajes y carga de LIFEPO  (recomendado calibrar (más abajo se indica), por la pequeña diferencia entre estados)
+//const double mVoltCarga[7]={3,3.2,3.3,3.6,3.65,4.05,4.2}; //tabla de relación de voltajes y carga de LiCo y LiPo
+
+const byte luminLED=150; //De 20 a 255, el valor de luminosidad máxima según el LED (para ahorro de energía y duración del LED recomendado valores <150)
+
+const double refIntVolt=1.088; //Aquí se calibra el valor de ref. int de 1,1V, que puede variar de 1,09 a 1,2V
+const byte minutos=10; //Después de estos minutos,si no hay variación de voltaje, desconectamos electrónica (relé y lámpara)
+
+//Definición pines analógicos monitorización batería
+//En el ATTiny85 las entradas son (1)=P2; (2)=P4; (3)=P3; (0)=P5 y pines PWM P0, P1 y P4
+#define relePIN        0 //Conectar la batería y luces; desconectar cuando la batería baje de 2,8V
+#define intPIN         2 //PB2 is INT0 pin; Pin de interruptor para encender Y apagar bici (activar relé), *** HAY QUE CONECTARLO A GND (Tierra) para activarlo
+#define ledPIN         1 //Pin del LED incorporado, para hacerlo parpadear, en el ATTiny85 B es el 1
+#define zumbPIN        5 //Para activar zumbador intermitentemente cuando la batería baje del 5%
+//Definición LED RGB Neopixel PL-9823-F5/F8 http://surrealitylabs.com/2014/08/playing-with-the-pl9823-f5-a-breadboardable-neopixel-compatible-led/
+// Which pin on the Arduino is connected to the NeoPixels?
+#define PIN            4 //Salida que usamos para la comunicación digital con el LED RGB
+// Número de Neopixels conectados al Arduino
+#define NUMPIXELS      1
+
+//*************************************************************************************
+
+unsigned long millisInicio=0; //Para comprobar paso de horas
+unsigned long millisUso=0; //Tiempo en milisegundos cada vez que comprobamos si se está usando, y si no desconectamos para ahorrar batería
+unsigned long millisVoltaje=0; //Segunda comprobación voltaje
+boolean parada=false; //Para doble chequeo de parada
+boolean voltIgual=false; //Chequeo se vuelve a cumplir; sería raro que coincidiera dos veces seguidas si no está parada
+boolean alarma=false; //Hacer la alarma intermitente
+boolean parpadea=false; //Para parpadear rojo
+double voltajeAnt=0; //Guardar voltaje anterior
+double voltaje[6]={0,0,0,0,0,0}; //Valores obtenidos muestras
+double value=0; //Voltaje obtenido
+unsigned long timeLED=0; //Almacenar tiempo transcurrido
+byte color=0; //Para guardar el color anterior
+
+// When we setup the NeoPixel library, we tell it how many pixels, and which pin to use to send signals.
+// Note that for older NeoPixel strips you might need to change the third parameter--see the strandtest
+// example for more information on possible values.
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+void setup()   { 
+
+////Resetea la EEPROM la primera vez que la usamos (NO TENGO ESPACIO PARA USAR ESTO)
+//EEPROM.setMemPool(0,512); //Establecemos inicio y tamaño de EEPROM de la tarjeta utilizada
+//EEPROM.setMaxAllowedWrites(128); //Mínimo para que pueda hacerse el primer borrado completo
+////rellenamos de 0 los datos de EEPROM
+////Attiny85 tiene 512 Bytes de EEPROM; ajustar según el que uséis
+//if (EEPROM.readLong(508)!=4011983) { //En ese punto, preferiblemente al final, guardo un valor para saber si ya la he reseteado
+//  for(int i=0; i<500; i=i+4) { //Ajustar el valor según el tamaño de la (EEPROM)-8
+//     EEPROM.update(i,0);
+//      }
+//  EEPROM.update(508,4011983); //Almacenamos un número indicativo de que ya se ha inicializado en la última posición
+//  //Serial.println("Borrado de EEPROM terminado"); //sólo debería aparecer 1 vez
+//}
+
+//Definir pines
+//You need not set pin mode for analogRead - though if you have set the pin to
+//output and later want to read from it then you need to set pinMode(0,INPUT);
+//where 0 is the physical pin number not the analog input number.
+//pinMode(PIN, OUTPUT);
+pinMode(relePIN,OUTPUT);
+pinMode(ledPIN,OUTPUT);
+pinMode(zumbPIN,OUTPUT);
+//Pin para reactivar el motor (OPCIONAL) (tendríamos que conectarlo a tierra para activarlo)
+pinMode(intPIN,INPUT);
+digitalWrite(intPIN, HIGH); //Ponemos el pin en HIGH mediante su resistencia interna (pullup), evitando interferencias
+
+digitalWrite(relePIN,HIGH); //Encendemos la bici al conectarlo
+
+timeLED=millis();
+millisUso=millis();
+pixels.begin(); // This initializes the NeoPixel library.
+//Encendemos los LEDs para indicar puesta en marcha y comprobar que los colores funcionan
+//Eliminar esto si necesitamos más memoria para el programa
+  // pixels.Color convierte valores RGB, de 0,0,0 hasta 255,255,255; (verde, rojo, azul)
+  pixels.setPixelColor(0, pixels.Color(0,150,0)); //Encendemos rojo
+  pixels.show(); // Envía el color actualizado al hardware. 
+  delay(200);
+  pixels.setPixelColor(0, pixels.Color(150,0,0));
+  pixels.show(); //Verde
+  delay(200);
+  pixels.setPixelColor(0, pixels.Color(0,0,150));
+  pixels.show(); //Azul
+  delay(200);
+  for(int x=0; x<1; x++) { //Hacemos parpadear todos dos veces
+  pixels.setPixelColor(0, pixels.Color(100,100,100)); //Blanco
+  pixels.show();
+  delay(300);
+  pixels.setPixelColor(0, pixels.Color(0,0,0)); //apagado
+  pixels.show(); 
+  delay(300);
+  }
+//millisInicio=millis();
+//Serial.begin(9600);
+//Serial.println("Iniciamos programa");
+
+}
+
+void loop() {
+
+//Recoge 6 muestras para sacar medias
+Serial.println("Leemos valores");
+for(int x=0; x<6; x++) {    
+  //coge el voltaje en milivoltios, pasamos a voltios con la rutina doubleMap ahorrando memoria
+  voltaje[x] = doubleMap(double(readVcc()),0,6000,0,6); //Pasamos los valores de entre 0 a 6000 a valores entre 0 y 6V
+  delay(15); // espera entre lecturas
+}
+//Ordenamos para descartar bajo y alto
+for(int x=0; x<6; x++) {    
+  for(int y=0; y<6; y++) {    
+    if (voltaje[y]<voltaje[y+1]) {
+      value=voltaje[y];
+      voltaje[y]=voltaje[y+1];
+      voltaje[y+1]=value;
+    }
+  }
+}
+
+//Sacar media y voltaje real
+value=0;
+for(int x=1; x<5; x++) {    
+  value=value+voltaje[x];
+}
+value=(double)value/4;
+value= int(value*100); //Trabajamos con sólo dos decimales (no merece la pena más exactitud)
+value= value/100;
+
+//DEBUG CALIBRACIÓN VOLTAJE Para saber décimas voltaje lee el Attiny y ajustarlo en el valor calibVolt
+//El led rojo parpadeará tantas veces como valor (0,12 = 12 veces)
+//Descomentar para calibrar; recomendado probar con voltaje bajo para contar poco ;)
+//analogWrite(ledPIN, 0);
+//delay(2000);
+//value=value-int(value);
+//value=int((value-int(value))*100); //le quitamos parte entera (3,09 -> 9 pulsos del led)
+//for(int x=0; x<value; x++) {
+//  analogWrite(ledPIN, 100); //Rojo
+//  delay(200);
+//  analogWrite(ledPIN, 0);
+//  delay(600);
+//}
+//delay(2000);
+
+//Aquí se evalúa el color del led según los valores del voltaje, para evitar que fluctúe se tiene en cuenta
+//qué color tenía antes, y no cambia hasta que haya una variación mayor de 0,02V
+if (value<=mVoltCarga[1] && value>.5) { //ROJO PARPADEANTE, SE DAÑA LA BATERÍA; RECARGAR LO ANTES POSIBLE
+      color=0;
+      if (parpadea==false) {
+        pixels.setPixelColor(0, pixels.Color(0,luminLED,0));
+        parpadea=true;
+      }
+      else { pixels.setPixelColor(0, pixels.Color(0,0,0)); //apagado
+      parpadea=false;
+      }
+}
+else if (value<=mVoltCarga[2] && value>mVoltCarga[1]) { //ROJO; Recargar lo antes posible
+      //Si el color no estaba establecido o era el mismo o ha variado suficientemente el voltaje
+      if (color==0  or color==1 or (color==2 and value<=mVoltCarga[2]-0.02)) { 
+        color=1;
+        pixels.setPixelColor(0, pixels.Color(0,luminLED,0));
+      }
+}      
+else if (value<=mVoltCarga[3] && value>mVoltCarga[2]) { //NARANJA; se parece más al rojo
+      if (color==0  or color==2 or (color==3 and value<=mVoltCarga[3]-0.02) or (color==1 and value>mVoltCarga[2]+0.02) ) { 
+        color=2;
+        pixels.setPixelColor(0, pixels.Color(luminLED*0.3,luminLED*0.7,luminLED*0.1)); //Entre el 20 y el 30%; momento de recargar la batería
+      }
+}
+else if (value<=mVoltCarga[4] && value>mVoltCarga[3]) { //AMARILLO color 3
+      if (color==0  or color==3 or (color==4 and value<=mVoltCarga[4]-0.02) or (color==2 and value>mVoltCarga[3]+0.02) ) { 
+        color=3;
+        pixels.setPixelColor(0, pixels.Color(luminLED*0.4,luminLED*0.5,0)); //Aconsejable recargar batería
+      }
+}
+else if (value<=mVoltCarga[5] && value>mVoltCarga[4]) {//VERDE color 4
+      if (color==0  or color==4 or (color==5 and value<=mVoltCarga[5]-0.02) or (color==3 and value>mVoltCarga[4]+0.02) ) { 
+        color=4;
+        pixels.setPixelColor(0, pixels.Color(luminLED*0.5,0,0)); //Le bajo la intensidad todavía más; al fin y al cabo, siempre estará encendido
+      }
+}
+else if (value<=mVoltCarga[6] && value>mVoltCarga[5]) {//AZUL color 5
+      if (color==0 or color==5 or (color==6 and value<=mVoltCarga[6]-0.02) or (color==4 and value>mVoltCarga[5]+0.02) ) { 
+        color=5;
+        pixels.setPixelColor(0, pixels.Color(0,0,luminLED)); //Se ha sobrecargado; recomendable no llegar al azul para maximizar vida útil  
+      }
+}
+else  { //>100% VIOLETA 6
+      color=6;
+      pixels.setPixelColor(0, pixels.Color(0,luminLED*0.6,luminLED*0.75)); //Por encima de lo recomendado; PELIGROSO
+}
+pixels.show(); //Actualizamos el color del led
+
+//Comprobamos si millis se ha desbordado (tras 50 días)
+if (millisUso>millis()) {
+  millisUso=millis();
+}
+if (millisVoltaje>millis()) {
+  millisVoltaje=millis();
+}
+//Si detectamos que la bici no se usa durante el tiempo indicado, apagamos todo, hasta que no se pulse en interruptor del P2 no vuelve a continuar
+if ((millis()-millisUso)>=20000*long(minutos)) { //Al hacer tres comprobaciones dentro del tiempo marcado, dividimos entre tres los minutos
+  millisUso=millis();
+  if (parada==false) {
+    parada=true;
+    voltajeAnt=value; //Para redondear a 3 dígitos (sólo nos interesa comparar con dos decimales)
+  }
+  else { 
+    parada=false;
+    if (value<=voltajeAnt-0.01 and value<=voltajeAnt+0.01) {
+      voltIgual=true;
+      millisVoltaje=millis();
+    }
+  }
+}
+
+if (voltIgual==true && (millis()-millisVoltaje)>=20000*long(minutos)) {
+    millisVoltaje=millis(); //reseteamos tiempo
+    voltIgual=false;
+    if (voltajeAnt==value) {
+      //En dos chequeos durante el tiempo no ha cambiado voltaje, por lo que dormimos la cpu
+      apagaTodo();
+    }
+}
+
+//Para protección de batería
+//Si baja del 4,5% la batería, activamos zumbador hasta que sea del 1% o menor
+if (value<=(mVoltCarga[0]+mVoltCarga[1])/2 && value>=mVoltCarga[0]) {
+  if (alarma==false) {
+    alarma=true;
+    digitalWrite(zumbPIN,HIGH);
+  }
+  else {
+  alarma=false;
+  digitalWrite(zumbPIN, LOW);
+  }
+}
+//si baja del valor de 1% hacemos sonar alarma brevemente y apagamos todo
+if (value<=mVoltCarga[0]) {
+  digitalWrite(relePIN,LOW);
+  for(int x=1; x<20; x++) {  
+    digitalWrite(zumbPIN,HIGH);
+    delay(100);
+    digitalWrite(zumbPIN, LOW); //Desactivamos alarma por si quedaba activada
+    delay(100);
+  }
+  apagaTodo();
+}
+
+//Utilizo la EEPROM para valores estadísticos únicamente; se puede eliminar si se considera
+/* DATOS GUARDADOS EN EEPROM *PENDIENTE DE HACER
+ *  0: Horas funcionamiento Arduino
+ *  3: Último voltaje Arduino, para controlar el número de recargas
+ *  7: Contador de recargas de baterías
+ *  11: Contador de viajes/encendidos
+ *  15: Voltaje máximo histórico
+ *  19: Voltaje mínimo histórico
+ *  23: 
+ *  27: 
+ *  31: 
+
+*/
+
+////Guardamos las horas de uso en la EEPROM (NO PUEDO USARLO, NO DA LA MEMORIA DEL ATTINY85)
+//if ((millis()-millisInicio)>3600000) { //Ha pasado una hora
+//  millisInicio=millis(); 
+//  EEPROM.update(0,EEPROM.readLong(0)+1); //Añadimos una hora al contador
+//  } 
+////Comprobamos valor mínimo y actualizamos
+//if (EEPROM.readLong(19)>value)  {
+//  EEPROM.update(19,value);
+//}
+////Comprobamos valor máximo y actualizamos
+//if (EEPROM.readLong(15)<value) {
+//  EEPROM.update(15,value);
+//}
+
+  //Hacemos parpadear al LED comprobando el tiempo desde la última activación
+  if (timeLED>millis()) { //Cuando pasen 50 dias resetear
+    timeLED=millis();
+  }
+  if ((millis()-timeLED)>2000) {
+      analogWrite(ledPIN,100); //enciende LED brevemente indicando funcionamiento
+      timeLED=millis();
+      delay(50);
+      analogWrite(ledPIN,0);
+  }
+
+//Para velocidad de respuesta; si se detecta activación manual del interruptor, ponemos a dormir la bici
+//El resto del código se ejecutará 1,5 veces cada segundo aprox.
+for(int x=1; x<20; x++) {
+  if (digitalRead(intPIN)==LOW) {
+    apagaTodo();
+    break;
+  } 
+  delay(25); 
+}
+
+        
+}
+
+void apagaTodo() {
+      //Prefiero conectar el interruptor entre el PIN y Tierra, con una resistencia que mantenga el pin en HIGH de 10K
+      //Ya que por ejemplo en el P3, hay una resistencia pull-up y la resistencia externa podría no ser suficiente para ponerlo en LOW
+      //pero si lo conectamos a Tierra, no habrá duda de que lo ponemos en LOW.
+      //Hay que tener en cuenta que sólo dormimos la cpu, pero todos los pines quedan con las salidas preestablecidas
+        digitalWrite(relePIN,LOW); //apagamos todo y ponemos al attiny a dormir
+        pixels.setPixelColor(0, pixels.Color(0,0,0)); //Apagamos LED, ya que es independiente; sigue gastando algo, pero menos
+        pixels.show(); //Actualizamos
+        delay(400); //Damos tiempo a soltar el interruptor
+        sleep(); //Dormimos
+        // Continuará aquí tras la interrupción al activar interruptor
+        digitalWrite(relePIN,HIGH);
+}
+
+void sleep() { //Válido para todos los Arduino en teoría
+
+    GIMSK |= _BV(PCIE);                     // Enable Pin Change Interrupts
+    PCMSK |= _BV(PCINT2);                   // Usar Pin entrada 2, que es P4
+    ADCSRA &= ~_BV(ADEN);                   // ADC off
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);    // replaces above statement
+
+    sleep_enable();                         // Sets the Sleep Enable bit in the MCUCR Register (SE BIT)
+    sei();                                  // Enable interrupts
+    sleep_cpu();                            // sleep
+    // Continuará aquí tras la interrupción
+    cli();                                  // Disable interrupts
+    PCMSK &= ~_BV(PCINT2);                  // Turn off PB3 as interrupt pin
+    sleep_disable();                        // Clear SE bit
+    ADCSRA |= _BV(ADEN);                    // ADC on
+
+    sei();                                  // Enable interrupts
+} // sleep
+
+ISR(PCINT0_vect) {
+    // Se llama a esta rutina cuando ocurre la interrupción; no la necesito utilizar
+    }
+
+// *************** RUTINAS LECTURA VOLTAJE ***************
+double doubleMap(double x, double in_min, double in_max, double out_min, double out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+long readVcc() {
+  // Read 1.1V reference against AVcc
+  // set the reference to Vcc and the measurement to the internal 1.1V reference
+  #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+    ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
+    ADMUX = _BV(MUX5) | _BV(MUX0);
+  #elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+    ADMUX = _BV(MUX3) | _BV(MUX2);
+  #else
+    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #endif  
+ 
+  delay(2); // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Start conversion
+  while (bit_is_set(ADCSRA,ADSC)); // measuring
+ 
+  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH  
+  uint8_t high = ADCH; // unlocks both
+ 
+  long result = (high<<8) | low;
+  //la referencia interna puede variar entre 1,08 y 1,2V. He preferido hacer la calibración sobre el resultado en código
+  result = refIntVolt*1023*1000 / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
+  return result; // Vcc in millivolts
+}
