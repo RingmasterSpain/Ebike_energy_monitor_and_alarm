@@ -1350,6 +1350,1327 @@ int MPU6050_write(int start, const uint8_t *pData, int size)
 // function, and it is only a convenient function
 // to make it easier to write a single register.
 //
+/*  ==================================================================
+
+  Sketch control pensado para un Atmel 328
+  Activa un LED RGB según el voltaje y tipo batería (Divisor voltaje)
+  Morado sobrecarga, azul 90-100%, verde 50-90%, amarillo del 30 al 40%,
+  naranja del 20 al 30%, rojo 10 al 20% y rojo parpadeante por debajo del 10%
+
+  Además, cuando está "dormido" vigila si alguien mueve la vici con el GY-521,
+  haciendo sonar la alarma en ese caso. Y si se olvida encendida y no detecta movimiento
+  en x minutos, se apaga automáticamente.
+
+  Autor: David Losada, basado en trabajos previos de otros autores:
+  Parte de código de la referencia rápida del Digispark: http://digistump.com/wiki/digispark/quickref
+
+  Code for the MPU-6050 Accelerometer + Gyro
+  By arduino.cc user "Krodal".
+  July 2013
+  Open Source / Public Domain
+
+  Version: 0.92 bajo licencia GPLv3
+  Fecha: enero 2017
+
+  Includes NeoPixel Ring simple sketch code from (c) 2013 Shae Erisson
+  released under the GPLv3 license to match the rest of the AdaFruit NeoPixel library
+
+  ==================================================================   */
+
+//#include <EEPROMex.h> //La librería Neopixel ocupa demasiado en el ATtiny; anulo toda la parte de guardado de datos estadísticos
+#include <Adafruit_NeoPixel.h> //Para el control del led
+
+//from https://bigdanzblog.wordpress.com/2014/08/10/attiny85-wake-from-sleep-on-pin-state-change-code-example/
+#include <avr/sleep.h>
+//Librerías para dormir al procesador y ahorrar energía cuando no hace nada
+#include <avr/power.h>
+#include <avr/wdt.h>
+#include <avr/interrupt.h>  //creo que al final no se usa, pero mejor dejarla (el compilador no la incluye si no se usa, por lo que no ocupa)
+
+//******************* A CAMBIAR SEGÚN TU CONFIGURACIÓN ********************************
+
+//Relación de voltaje y estado de carga de la batería; se puede agregar para cualquier tipo de batería, siempre teniendo en cuenta que estaremos comprobando sólo una celda de hasta 5V
+//por lo que es imprescindible utilizar un BMS de equilibrado de celdas en la carga para evitar problemas con las celdas no monitorizadas
+//Descomentamos el tipo de batería que queramos utilizar
+//(VALORES %: 1%,8%,20%,30%,40%,90%,100%)
+const double mVoltCarga[7] = {2.75, 3.10, 3.17, 3.198, 3.22, 3.4, 3.6}; //tabla de relación de voltajes y carga de LIFEPO  (recomendado calibrar (más abajo se indica), por la pequeña diferencia entre estados)
+//const double mVoltCarga[7]={3,3.2,3.3,3.6,3.65,4.05,4.2}; //tabla de relación de voltajes y carga de LiCo y LiPo
+#define ajusteVolt  0.33 //Voltaje de calibración según el chip y exactitud de resistencias
+
+#define luminLED    140 //De 20 a 255, el valor de luminosidad máxima según el LED (para ahorro de energía y duración del LED recomendado valores <150)
+
+#define minutos     5 //Después de estos minutos, si no hay movimiento, desconectamos electrónica (relé y lámpara)
+
+//He comprobado que si los datos de aceleración en formato crudo (raw) superan los valores anteriores en 500, alquien lo está manipulando
+#define sensibilidadAccel 500 //Pero podéis poner el valor que estiméis según la sensibilidad de vuestro equipo
+#define resetAlarmaSeg   30 //Tiempo en segundos para anular alarma si no hay movimiento
+#define tiempoEspera  20 //Tiempo en segundos de espera desde que dejamos apagada la bici hasta que se activa alarma antirrobo.
+
+//Definición pines analógicos monitorización batería
+//En el ATTiny85 las entradas son (1)=P2; (2)=P4; (3)=P3; (0)=P5 y pines PWM P0, P1 y P4
+#define relePIN        3 //Conectar la batería y luces; desconectar cuando la batería baje de 2,8V
+#define intPIN         2 //PB2 is INT0 pin; Pin de interruptor para encender Y apagar bici (activar relé), *** HAY QUE CONECTARLO A GND (Tierra) para activarlo
+#define ledPIN         13 //Pin del LED incorporado, para hacerlo parpadear, en el ATTiny85 B es el 1
+#define zumbPIN        7 //Para activar zumbador intermitentemente cuando la batería baje del 5%
+#define voltajePIN     2 //Entrada de voltaje con divisor de voltaje
+//Definición LED RGB Neopixel PL-9823-F5/F8 http://surrealitylabs.com/2014/08/playing-with-the-pl9823-f5-a-breadboardable-neopixel-compatible-led/
+// Which pin on the Arduino is connected to the NeoPixels?
+#define PIN            4 //Salida que usamos para la comunicación digital con el LED RGB
+// Número de Neopixels conectados al Arduino
+#define NUMPIXELS      1
+
+//***********FIN CONFIGURACIÓN PERSONALIZADA***************************************
+
+//unsigned long millisInicio=0; //Para comprobar paso de horas
+//unsigned long millisVoltaje=0; //Segunda comprobación voltaje
+boolean parpadea = false; //Para parpadear rojo
+boolean encendido = true; //Controlamos si está desconectada la bici
+boolean movimiento = false; //Para comprobar si está usándose
+byte contAlarma=resetAlarmaSeg; //Cuando pasen estos segundos desde el último movimiento, ponemos contador a 0, para resetear si se ha movido por error puntualmente
+
+double voltaje[6] = {0, 0, 0, 0, 0, 0}; //Valores obtenidos muestras
+double value = 0; //Voltaje obtenido
+unsigned long contador = 0; //Para comprobar el tiempo según el número de veces que se ejecute
+//unsigned long timeLED=0; //Almacenar tiempo transcurrido
+
+byte color = 0; //Para guardar el color anterior
+
+// When we setup the NeoPixel library, we tell it how many pixels, and which pin to use to send signals.
+// Note that for older NeoPixel strips you might need to change the third parameter--see the strandtest
+// example for more information on possible values.
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+
+// **** SIGUIENTE PARTE DEFINICIONES Y CONFIG DEL MPU-6050
+
+// Documentation MPU-6050:
+// - The InvenSense documents:
+//   - "MPU-6000 and MPU-6050 Product Specification",
+//     PS-MPU-6000A.pdf
+//   - "MPU-6000 and MPU-6050 Register Map and Descriptions",
+//     RM-MPU-6000A.pdf or RS-MPU-6000A.pdf
+//   - "MPU-6000/MPU-6050 9-Axis Evaluation Board User Guide"
+//     AN-MPU-6000EVB.pdf
+//
+// The accuracy is 16-bits.
+//
+// Temperature sensor from -40 to +85 degrees Celsius
+//   340 per degrees, -512 at 35 degrees.
+//
+// At power-up, all registers are zero, except these two:
+//      Register 0x6B (PWR_MGMT_2) = 0x40  (I read zero).
+//      Register 0x75 (WHO_AM_I)   = 0x68.
+//
+
+#include <Wire.h>
+long accelX = 0; //Para comparar los datos raw con los anteriores
+long accelY = 0;
+long accelZ = 0;
+long accelXAnt = 0;
+long accelYAnt = 0;
+long accelZAnt = 0;
+int alarmaAct = 0; //Contador de movimientos detectados
+byte esperaAlarma = tiempoEspera; //Espera x segundos desde que se apaga sin movimiento a activar la alarma
+//byte bateriaCriticaSeg=tiempoCritica; //Tiempo de espera con batería baja antes de apagar todo
+
+// The name of the sensor is "MPU-6050".
+// For program code, I omit the '-',
+// therefor I use the name "MPU6050....".
+
+
+// Register names according to the datasheet.
+// According to the InvenSense document
+// "MPU-6000 and MPU-6050 Register Map
+// and Descriptions Revision 3.2", there are no registers
+// at 0x02 ... 0x18, but according other information
+// the registers in that unknown area are for gain
+// and offsets.
+//
+#define MPU6050_AUX_VDDIO          0x01   // R/W
+#define MPU6050_SMPLRT_DIV         0x19   // R/W
+#define MPU6050_CONFIG             0x1A   // R/W
+#define MPU6050_GYRO_CONFIG        0x1B   // R/W
+#define MPU6050_ACCEL_CONFIG       0x1C   // R/W
+#define MPU6050_FF_THR             0x1D   // R/W
+#define MPU6050_FF_DUR             0x1E   // R/W
+#define MPU6050_MOT_THR            0x1F   // R/W
+#define MPU6050_MOT_DUR            0x20   // R/W
+#define MPU6050_ZRMOT_THR          0x21   // R/W
+#define MPU6050_ZRMOT_DUR          0x22   // R/W
+#define MPU6050_FIFO_EN            0x23   // R/W
+#define MPU6050_I2C_MST_CTRL       0x24   // R/W
+#define MPU6050_I2C_SLV0_ADDR      0x25   // R/W
+#define MPU6050_I2C_SLV0_REG       0x26   // R/W
+#define MPU6050_I2C_SLV0_CTRL      0x27   // R/W
+#define MPU6050_I2C_SLV1_ADDR      0x28   // R/W
+#define MPU6050_I2C_SLV1_REG       0x29   // R/W
+#define MPU6050_I2C_SLV1_CTRL      0x2A   // R/W
+#define MPU6050_I2C_SLV2_ADDR      0x2B   // R/W
+#define MPU6050_I2C_SLV2_REG       0x2C   // R/W
+#define MPU6050_I2C_SLV2_CTRL      0x2D   // R/W
+#define MPU6050_I2C_SLV3_ADDR      0x2E   // R/W
+#define MPU6050_I2C_SLV3_REG       0x2F   // R/W
+#define MPU6050_I2C_SLV3_CTRL      0x30   // R/W
+#define MPU6050_I2C_SLV4_ADDR      0x31   // R/W
+#define MPU6050_I2C_SLV4_REG       0x32   // R/W
+#define MPU6050_I2C_SLV4_DO        0x33   // R/W
+#define MPU6050_I2C_SLV4_CTRL      0x34   // R/W
+#define MPU6050_I2C_SLV4_DI        0x35   // R  
+#define MPU6050_I2C_MST_STATUS     0x36   // R
+#define MPU6050_INT_PIN_CFG        0x37   // R/W
+#define MPU6050_INT_ENABLE         0x38   // R/W
+#define MPU6050_INT_STATUS         0x3A   // R  
+#define MPU6050_ACCEL_XOUT_H       0x3B   // R  
+#define MPU6050_ACCEL_XOUT_L       0x3C   // R  
+#define MPU6050_ACCEL_YOUT_H       0x3D   // R  
+#define MPU6050_ACCEL_YOUT_L       0x3E   // R  
+#define MPU6050_ACCEL_ZOUT_H       0x3F   // R  
+#define MPU6050_ACCEL_ZOUT_L       0x40   // R  
+#define MPU6050_TEMP_OUT_H         0x41   // R  
+#define MPU6050_TEMP_OUT_L         0x42   // R  
+#define MPU6050_GYRO_XOUT_H        0x43   // R  
+#define MPU6050_GYRO_XOUT_L        0x44   // R  
+#define MPU6050_GYRO_YOUT_H        0x45   // R  
+#define MPU6050_GYRO_YOUT_L        0x46   // R  
+#define MPU6050_GYRO_ZOUT_H        0x47   // R  
+#define MPU6050_GYRO_ZOUT_L        0x48   // R  
+#define MPU6050_EXT_SENS_DATA_00   0x49   // R  
+#define MPU6050_EXT_SENS_DATA_01   0x4A   // R  
+#define MPU6050_EXT_SENS_DATA_02   0x4B   // R  
+#define MPU6050_EXT_SENS_DATA_03   0x4C   // R  
+#define MPU6050_EXT_SENS_DATA_04   0x4D   // R  
+#define MPU6050_EXT_SENS_DATA_05   0x4E   // R  
+#define MPU6050_EXT_SENS_DATA_06   0x4F   // R  
+#define MPU6050_EXT_SENS_DATA_07   0x50   // R  
+#define MPU6050_EXT_SENS_DATA_08   0x51   // R  
+#define MPU6050_EXT_SENS_DATA_09   0x52   // R  
+#define MPU6050_EXT_SENS_DATA_10   0x53   // R  
+#define MPU6050_EXT_SENS_DATA_11   0x54   // R  
+#define MPU6050_EXT_SENS_DATA_12   0x55   // R  
+#define MPU6050_EXT_SENS_DATA_13   0x56   // R  
+#define MPU6050_EXT_SENS_DATA_14   0x57   // R  
+#define MPU6050_EXT_SENS_DATA_15   0x58   // R  
+#define MPU6050_EXT_SENS_DATA_16   0x59   // R  
+#define MPU6050_EXT_SENS_DATA_17   0x5A   // R  
+#define MPU6050_EXT_SENS_DATA_18   0x5B   // R  
+#define MPU6050_EXT_SENS_DATA_19   0x5C   // R  
+#define MPU6050_EXT_SENS_DATA_20   0x5D   // R  
+#define MPU6050_EXT_SENS_DATA_21   0x5E   // R  
+#define MPU6050_EXT_SENS_DATA_22   0x5F   // R  
+#define MPU6050_EXT_SENS_DATA_23   0x60   // R  
+#define MPU6050_MOT_DETECT_STATUS  0x61   // R  
+#define MPU6050_I2C_SLV0_DO        0x63   // R/W
+#define MPU6050_I2C_SLV1_DO        0x64   // R/W
+#define MPU6050_I2C_SLV2_DO        0x65   // R/W
+#define MPU6050_I2C_SLV3_DO        0x66   // R/W
+#define MPU6050_I2C_MST_DELAY_CTRL 0x67   // R/W
+#define MPU6050_SIGNAL_PATH_RESET  0x68   // R/W
+#define MPU6050_MOT_DETECT_CTRL    0x69   // R/W
+#define MPU6050_USER_CTRL          0x6A   // R/W
+#define MPU6050_PWR_MGMT_1         0x6B   // R/W
+#define MPU6050_PWR_MGMT_2         0x6C   // R/W
+#define MPU6050_FIFO_COUNTH        0x72   // R/W
+#define MPU6050_FIFO_COUNTL        0x73   // R/W
+#define MPU6050_FIFO_R_W           0x74   // R/W
+#define MPU6050_WHO_AM_I           0x75   // R
+
+
+// Defines for the bits, to be able to change
+// between bit number and binary definition.
+// By using the bit number, programming the sensor
+// is like programming the AVR microcontroller.
+// But instead of using "(1<<X)", or "_BV(X)",
+// the Arduino "bit(X)" is used.
+#define MPU6050_D0 0
+#define MPU6050_D1 1
+#define MPU6050_D2 2
+#define MPU6050_D3 3
+#define MPU6050_D4 4
+#define MPU6050_D5 5
+#define MPU6050_D6 6
+#define MPU6050_D7 7
+
+// AUX_VDDIO Register
+#define MPU6050_AUX_VDDIO MPU6050_D7  // I2C high: 1=VDD, 0=VLOGIC
+
+// CONFIG Register
+// DLPF is Digital Low Pass Filter for both gyro and accelerometers.
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_DLPF_CFG0     MPU6050_D0
+#define MPU6050_DLPF_CFG1     MPU6050_D1
+#define MPU6050_DLPF_CFG2     MPU6050_D2
+#define MPU6050_EXT_SYNC_SET0 MPU6050_D3
+#define MPU6050_EXT_SYNC_SET1 MPU6050_D4
+#define MPU6050_EXT_SYNC_SET2 MPU6050_D5
+
+// Combined definitions for the EXT_SYNC_SET values
+#define MPU6050_EXT_SYNC_SET_0 (0)
+#define MPU6050_EXT_SYNC_SET_1 (bit(MPU6050_EXT_SYNC_SET0))
+#define MPU6050_EXT_SYNC_SET_2 (bit(MPU6050_EXT_SYNC_SET1))
+#define MPU6050_EXT_SYNC_SET_3 (bit(MPU6050_EXT_SYNC_SET1)|bit(MPU6050_EXT_SYNC_SET0))
+#define MPU6050_EXT_SYNC_SET_4 (bit(MPU6050_EXT_SYNC_SET2))
+#define MPU6050_EXT_SYNC_SET_5 (bit(MPU6050_EXT_SYNC_SET2)|bit(MPU6050_EXT_SYNC_SET0))
+#define MPU6050_EXT_SYNC_SET_6 (bit(MPU6050_EXT_SYNC_SET2)|bit(MPU6050_EXT_SYNC_SET1))
+#define MPU6050_EXT_SYNC_SET_7 (bit(MPU6050_EXT_SYNC_SET2)|bit(MPU6050_EXT_SYNC_SET1)|bit(MPU6050_EXT_SYNC_SET0))
+
+// Alternative names for the combined definitions.
+#define MPU6050_EXT_SYNC_DISABLED     MPU6050_EXT_SYNC_SET_0
+#define MPU6050_EXT_SYNC_TEMP_OUT_L   MPU6050_EXT_SYNC_SET_1
+#define MPU6050_EXT_SYNC_GYRO_XOUT_L  MPU6050_EXT_SYNC_SET_2
+#define MPU6050_EXT_SYNC_GYRO_YOUT_L  MPU6050_EXT_SYNC_SET_3
+#define MPU6050_EXT_SYNC_GYRO_ZOUT_L  MPU6050_EXT_SYNC_SET_4
+#define MPU6050_EXT_SYNC_ACCEL_XOUT_L MPU6050_EXT_SYNC_SET_5
+#define MPU6050_EXT_SYNC_ACCEL_YOUT_L MPU6050_EXT_SYNC_SET_6
+#define MPU6050_EXT_SYNC_ACCEL_ZOUT_L MPU6050_EXT_SYNC_SET_7
+
+// Combined definitions for the DLPF_CFG values
+#define MPU6050_DLPF_CFG_0 (0)
+#define MPU6050_DLPF_CFG_1 (bit(MPU6050_DLPF_CFG0))
+#define MPU6050_DLPF_CFG_2 (bit(MPU6050_DLPF_CFG1))
+#define MPU6050_DLPF_CFG_3 (bit(MPU6050_DLPF_CFG1)|bit(MPU6050_DLPF_CFG0))
+#define MPU6050_DLPF_CFG_4 (bit(MPU6050_DLPF_CFG2))
+#define MPU6050_DLPF_CFG_5 (bit(MPU6050_DLPF_CFG2)|bit(MPU6050_DLPF_CFG0))
+#define MPU6050_DLPF_CFG_6 (bit(MPU6050_DLPF_CFG2)|bit(MPU6050_DLPF_CFG1))
+#define MPU6050_DLPF_CFG_7 (bit(MPU6050_DLPF_CFG2)|bit(MPU6050_DLPF_CFG1)|bit(MPU6050_DLPF_CFG0))
+
+// Alternative names for the combined definitions
+// This name uses the bandwidth (Hz) for the accelometer,
+// for the gyro the bandwidth is almost the same.
+#define MPU6050_DLPF_260HZ    MPU6050_DLPF_CFG_0
+#define MPU6050_DLPF_184HZ    MPU6050_DLPF_CFG_1
+#define MPU6050_DLPF_94HZ     MPU6050_DLPF_CFG_2
+#define MPU6050_DLPF_44HZ     MPU6050_DLPF_CFG_3
+#define MPU6050_DLPF_21HZ     MPU6050_DLPF_CFG_4
+#define MPU6050_DLPF_10HZ     MPU6050_DLPF_CFG_5
+#define MPU6050_DLPF_5HZ      MPU6050_DLPF_CFG_6
+#define MPU6050_DLPF_RESERVED MPU6050_DLPF_CFG_7
+
+// GYRO_CONFIG Register
+// The XG_ST, YG_ST, ZG_ST are bits for selftest.
+// The FS_SEL sets the range for the gyro.
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_FS_SEL0 MPU6050_D3
+#define MPU6050_FS_SEL1 MPU6050_D4
+#define MPU6050_ZG_ST   MPU6050_D5
+#define MPU6050_YG_ST   MPU6050_D6
+#define MPU6050_XG_ST   MPU6050_D7
+
+// Combined definitions for the FS_SEL values
+#define MPU6050_FS_SEL_0 (0)
+#define MPU6050_FS_SEL_1 (bit(MPU6050_FS_SEL0))
+#define MPU6050_FS_SEL_2 (bit(MPU6050_FS_SEL1))
+#define MPU6050_FS_SEL_3 (bit(MPU6050_FS_SEL1)|bit(MPU6050_FS_SEL0))
+
+// Alternative names for the combined definitions
+// The name uses the range in degrees per second.
+#define MPU6050_FS_SEL_250  MPU6050_FS_SEL_0
+#define MPU6050_FS_SEL_500  MPU6050_FS_SEL_1
+#define MPU6050_FS_SEL_1000 MPU6050_FS_SEL_2
+#define MPU6050_FS_SEL_2000 MPU6050_FS_SEL_3
+
+// ACCEL_CONFIG Register
+// The XA_ST, YA_ST, ZA_ST are bits for selftest.
+// The AFS_SEL sets the range for the accelerometer.
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_ACCEL_HPF0 MPU6050_D0
+#define MPU6050_ACCEL_HPF1 MPU6050_D1
+#define MPU6050_ACCEL_HPF2 MPU6050_D2
+#define MPU6050_AFS_SEL0   MPU6050_D3
+#define MPU6050_AFS_SEL1   MPU6050_D4
+#define MPU6050_ZA_ST      MPU6050_D5
+#define MPU6050_YA_ST      MPU6050_D6
+#define MPU6050_XA_ST      MPU6050_D7
+
+// Combined definitions for the ACCEL_HPF values
+#define MPU6050_ACCEL_HPF_0 (0)
+#define MPU6050_ACCEL_HPF_1 (bit(MPU6050_ACCEL_HPF0))
+#define MPU6050_ACCEL_HPF_2 (bit(MPU6050_ACCEL_HPF1))
+#define MPU6050_ACCEL_HPF_3 (bit(MPU6050_ACCEL_HPF1)|bit(MPU6050_ACCEL_HPF0))
+#define MPU6050_ACCEL_HPF_4 (bit(MPU6050_ACCEL_HPF2))
+#define MPU6050_ACCEL_HPF_7 (bit(MPU6050_ACCEL_HPF2)|bit(MPU6050_ACCEL_HPF1)|bit(MPU6050_ACCEL_HPF0))
+
+// Alternative names for the combined definitions
+// The name uses the Cut-off frequency.
+#define MPU6050_ACCEL_HPF_RESET  MPU6050_ACCEL_HPF_0
+#define MPU6050_ACCEL_HPF_5HZ    MPU6050_ACCEL_HPF_1
+#define MPU6050_ACCEL_HPF_2_5HZ  MPU6050_ACCEL_HPF_2
+#define MPU6050_ACCEL_HPF_1_25HZ MPU6050_ACCEL_HPF_3
+#define MPU6050_ACCEL_HPF_0_63HZ MPU6050_ACCEL_HPF_4
+#define MPU6050_ACCEL_HPF_HOLD   MPU6050_ACCEL_HPF_7
+
+// Combined definitions for the AFS_SEL values
+#define MPU6050_AFS_SEL_0 (0)
+#define MPU6050_AFS_SEL_1 (bit(MPU6050_AFS_SEL0))
+#define MPU6050_AFS_SEL_2 (bit(MPU6050_AFS_SEL1))
+#define MPU6050_AFS_SEL_3 (bit(MPU6050_AFS_SEL1)|bit(MPU6050_AFS_SEL0))
+
+// Alternative names for the combined definitions
+// The name uses the full scale range for the accelerometer.
+#define MPU6050_AFS_SEL_2G  MPU6050_AFS_SEL_0
+#define MPU6050_AFS_SEL_4G  MPU6050_AFS_SEL_1
+#define MPU6050_AFS_SEL_8G  MPU6050_AFS_SEL_2
+#define MPU6050_AFS_SEL_16G MPU6050_AFS_SEL_3
+
+// FIFO_EN Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_SLV0_FIFO_EN  MPU6050_D0
+#define MPU6050_SLV1_FIFO_EN  MPU6050_D1
+#define MPU6050_SLV2_FIFO_EN  MPU6050_D2
+#define MPU6050_ACCEL_FIFO_EN MPU6050_D3
+#define MPU6050_ZG_FIFO_EN    MPU6050_D4
+#define MPU6050_YG_FIFO_EN    MPU6050_D5
+#define MPU6050_XG_FIFO_EN    MPU6050_D6
+#define MPU6050_TEMP_FIFO_EN  MPU6050_D7
+
+// I2C_MST_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_MST_CLK0  MPU6050_D0
+#define MPU6050_I2C_MST_CLK1  MPU6050_D1
+#define MPU6050_I2C_MST_CLK2  MPU6050_D2
+#define MPU6050_I2C_MST_CLK3  MPU6050_D3
+#define MPU6050_I2C_MST_P_NSR MPU6050_D4
+#define MPU6050_SLV_3_FIFO_EN MPU6050_D5
+#define MPU6050_WAIT_FOR_ES   MPU6050_D6
+#define MPU6050_MULT_MST_EN   MPU6050_D7
+
+// Combined definitions for the I2C_MST_CLK
+#define MPU6050_I2C_MST_CLK_0 (0)
+#define MPU6050_I2C_MST_CLK_1  (bit(MPU6050_I2C_MST_CLK0))
+#define MPU6050_I2C_MST_CLK_2  (bit(MPU6050_I2C_MST_CLK1))
+#define MPU6050_I2C_MST_CLK_3  (bit(MPU6050_I2C_MST_CLK1)|bit(MPU6050_I2C_MST_CLK0))
+#define MPU6050_I2C_MST_CLK_4  (bit(MPU6050_I2C_MST_CLK2))
+#define MPU6050_I2C_MST_CLK_5  (bit(MPU6050_I2C_MST_CLK2)|bit(MPU6050_I2C_MST_CLK0))
+#define MPU6050_I2C_MST_CLK_6  (bit(MPU6050_I2C_MST_CLK2)|bit(MPU6050_I2C_MST_CLK1))
+#define MPU6050_I2C_MST_CLK_7  (bit(MPU6050_I2C_MST_CLK2)|bit(MPU6050_I2C_MST_CLK1)|bit(MPU6050_I2C_MST_CLK0))
+#define MPU6050_I2C_MST_CLK_8  (bit(MPU6050_I2C_MST_CLK3))
+#define MPU6050_I2C_MST_CLK_9  (bit(MPU6050_I2C_MST_CLK3)|bit(MPU6050_I2C_MST_CLK0))
+#define MPU6050_I2C_MST_CLK_10 (bit(MPU6050_I2C_MST_CLK3)|bit(MPU6050_I2C_MST_CLK1))
+#define MPU6050_I2C_MST_CLK_11 (bit(MPU6050_I2C_MST_CLK3)|bit(MPU6050_I2C_MST_CLK1)|bit(MPU6050_I2C_MST_CLK0))
+#define MPU6050_I2C_MST_CLK_12 (bit(MPU6050_I2C_MST_CLK3)|bit(MPU6050_I2C_MST_CLK2))
+#define MPU6050_I2C_MST_CLK_13 (bit(MPU6050_I2C_MST_CLK3)|bit(MPU6050_I2C_MST_CLK2)|bit(MPU6050_I2C_MST_CLK0))
+#define MPU6050_I2C_MST_CLK_14 (bit(MPU6050_I2C_MST_CLK3)|bit(MPU6050_I2C_MST_CLK2)|bit(MPU6050_I2C_MST_CLK1))
+#define MPU6050_I2C_MST_CLK_15 (bit(MPU6050_I2C_MST_CLK3)|bit(MPU6050_I2C_MST_CLK2)|bit(MPU6050_I2C_MST_CLK1)|bit(MPU6050_I2C_MST_CLK0))
+
+// Alternative names for the combined definitions
+// The names uses I2C Master Clock Speed in kHz.
+#define MPU6050_I2C_MST_CLK_348KHZ MPU6050_I2C_MST_CLK_0
+#define MPU6050_I2C_MST_CLK_333KHZ MPU6050_I2C_MST_CLK_1
+#define MPU6050_I2C_MST_CLK_320KHZ MPU6050_I2C_MST_CLK_2
+#define MPU6050_I2C_MST_CLK_308KHZ MPU6050_I2C_MST_CLK_3
+#define MPU6050_I2C_MST_CLK_296KHZ MPU6050_I2C_MST_CLK_4
+#define MPU6050_I2C_MST_CLK_286KHZ MPU6050_I2C_MST_CLK_5
+#define MPU6050_I2C_MST_CLK_276KHZ MPU6050_I2C_MST_CLK_6
+#define MPU6050_I2C_MST_CLK_267KHZ MPU6050_I2C_MST_CLK_7
+#define MPU6050_I2C_MST_CLK_258KHZ MPU6050_I2C_MST_CLK_8
+#define MPU6050_I2C_MST_CLK_500KHZ MPU6050_I2C_MST_CLK_9
+#define MPU6050_I2C_MST_CLK_471KHZ MPU6050_I2C_MST_CLK_10
+#define MPU6050_I2C_MST_CLK_444KHZ MPU6050_I2C_MST_CLK_11
+#define MPU6050_I2C_MST_CLK_421KHZ MPU6050_I2C_MST_CLK_12
+#define MPU6050_I2C_MST_CLK_400KHZ MPU6050_I2C_MST_CLK_13
+#define MPU6050_I2C_MST_CLK_381KHZ MPU6050_I2C_MST_CLK_14
+#define MPU6050_I2C_MST_CLK_364KHZ MPU6050_I2C_MST_CLK_15
+
+// I2C_SLV0_ADDR Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV0_RW MPU6050_D7
+
+// I2C_SLV0_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV0_LEN0    MPU6050_D0
+#define MPU6050_I2C_SLV0_LEN1    MPU6050_D1
+#define MPU6050_I2C_SLV0_LEN2    MPU6050_D2
+#define MPU6050_I2C_SLV0_LEN3    MPU6050_D3
+#define MPU6050_I2C_SLV0_GRP     MPU6050_D4
+#define MPU6050_I2C_SLV0_REG_DIS MPU6050_D5
+#define MPU6050_I2C_SLV0_BYTE_SW MPU6050_D6
+#define MPU6050_I2C_SLV0_EN      MPU6050_D7
+
+// A mask for the length
+#define MPU6050_I2C_SLV0_LEN_MASK 0x0F
+
+// I2C_SLV1_ADDR Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV1_RW MPU6050_D7
+
+// I2C_SLV1_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV1_LEN0    MPU6050_D0
+#define MPU6050_I2C_SLV1_LEN1    MPU6050_D1
+#define MPU6050_I2C_SLV1_LEN2    MPU6050_D2
+#define MPU6050_I2C_SLV1_LEN3    MPU6050_D3
+#define MPU6050_I2C_SLV1_GRP     MPU6050_D4
+#define MPU6050_I2C_SLV1_REG_DIS MPU6050_D5
+#define MPU6050_I2C_SLV1_BYTE_SW MPU6050_D6
+#define MPU6050_I2C_SLV1_EN      MPU6050_D7
+
+// A mask for the length
+#define MPU6050_I2C_SLV1_LEN_MASK 0x0F
+
+// I2C_SLV2_ADDR Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV2_RW MPU6050_D7
+
+// I2C_SLV2_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV2_LEN0    MPU6050_D0
+#define MPU6050_I2C_SLV2_LEN1    MPU6050_D1
+#define MPU6050_I2C_SLV2_LEN2    MPU6050_D2
+#define MPU6050_I2C_SLV2_LEN3    MPU6050_D3
+#define MPU6050_I2C_SLV2_GRP     MPU6050_D4
+#define MPU6050_I2C_SLV2_REG_DIS MPU6050_D5
+#define MPU6050_I2C_SLV2_BYTE_SW MPU6050_D6
+#define MPU6050_I2C_SLV2_EN      MPU6050_D7
+
+// A mask for the length
+#define MPU6050_I2C_SLV2_LEN_MASK 0x0F
+
+// I2C_SLV3_ADDR Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV3_RW MPU6050_D7
+
+// I2C_SLV3_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV3_LEN0    MPU6050_D0
+#define MPU6050_I2C_SLV3_LEN1    MPU6050_D1
+#define MPU6050_I2C_SLV3_LEN2    MPU6050_D2
+#define MPU6050_I2C_SLV3_LEN3    MPU6050_D3
+#define MPU6050_I2C_SLV3_GRP     MPU6050_D4
+#define MPU6050_I2C_SLV3_REG_DIS MPU6050_D5
+#define MPU6050_I2C_SLV3_BYTE_SW MPU6050_D6
+#define MPU6050_I2C_SLV3_EN      MPU6050_D7
+
+// A mask for the length
+#define MPU6050_I2C_SLV3_LEN_MASK 0x0F
+
+// I2C_SLV4_ADDR Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV4_RW MPU6050_D7
+
+// I2C_SLV4_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_MST_DLY0     MPU6050_D0
+#define MPU6050_I2C_MST_DLY1     MPU6050_D1
+#define MPU6050_I2C_MST_DLY2     MPU6050_D2
+#define MPU6050_I2C_MST_DLY3     MPU6050_D3
+#define MPU6050_I2C_MST_DLY4     MPU6050_D4
+#define MPU6050_I2C_SLV4_REG_DIS MPU6050_D5
+#define MPU6050_I2C_SLV4_INT_EN  MPU6050_D6
+#define MPU6050_I2C_SLV4_EN      MPU6050_D7
+
+// A mask for the delay
+#define MPU6050_I2C_MST_DLY_MASK 0x1F
+
+// I2C_MST_STATUS Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV0_NACK MPU6050_D0
+#define MPU6050_I2C_SLV1_NACK MPU6050_D1
+#define MPU6050_I2C_SLV2_NACK MPU6050_D2
+#define MPU6050_I2C_SLV3_NACK MPU6050_D3
+#define MPU6050_I2C_SLV4_NACK MPU6050_D4
+#define MPU6050_I2C_LOST_ARB  MPU6050_D5
+#define MPU6050_I2C_SLV4_DONE MPU6050_D6
+#define MPU6050_PASS_THROUGH  MPU6050_D7
+
+// I2C_PIN_CFG Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_CLKOUT_EN       MPU6050_D0
+#define MPU6050_I2C_BYPASS_EN   MPU6050_D1
+#define MPU6050_FSYNC_INT_EN    MPU6050_D2
+#define MPU6050_FSYNC_INT_LEVEL MPU6050_D3
+#define MPU6050_INT_RD_CLEAR    MPU6050_D4
+#define MPU6050_LATCH_INT_EN    MPU6050_D5
+#define MPU6050_INT_OPEN        MPU6050_D6
+#define MPU6050_INT_LEVEL       MPU6050_D7
+
+// INT_ENABLE Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_DATA_RDY_EN    MPU6050_D0
+#define MPU6050_I2C_MST_INT_EN MPU6050_D3
+#define MPU6050_FIFO_OFLOW_EN  MPU6050_D4
+#define MPU6050_ZMOT_EN        MPU6050_D5
+#define MPU6050_MOT_EN         MPU6050_D6
+#define MPU6050_FF_EN          MPU6050_D7
+
+// INT_STATUS Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_DATA_RDY_INT   MPU6050_D0
+#define MPU6050_I2C_MST_INT    MPU6050_D3
+#define MPU6050_FIFO_OFLOW_INT MPU6050_D4
+#define MPU6050_ZMOT_INT       MPU6050_D5
+#define MPU6050_MOT_INT        MPU6050_D6
+#define MPU6050_FF_INT         MPU6050_D7
+
+// MOT_DETECT_STATUS Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_MOT_ZRMOT MPU6050_D0
+#define MPU6050_MOT_ZPOS  MPU6050_D2
+#define MPU6050_MOT_ZNEG  MPU6050_D3
+#define MPU6050_MOT_YPOS  MPU6050_D4
+#define MPU6050_MOT_YNEG  MPU6050_D5
+#define MPU6050_MOT_XPOS  MPU6050_D6
+#define MPU6050_MOT_XNEG  MPU6050_D7
+
+// IC2_MST_DELAY_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_I2C_SLV0_DLY_EN MPU6050_D0
+#define MPU6050_I2C_SLV1_DLY_EN MPU6050_D1
+#define MPU6050_I2C_SLV2_DLY_EN MPU6050_D2
+#define MPU6050_I2C_SLV3_DLY_EN MPU6050_D3
+#define MPU6050_I2C_SLV4_DLY_EN MPU6050_D4
+#define MPU6050_DELAY_ES_SHADOW MPU6050_D7
+
+// SIGNAL_PATH_RESET Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_TEMP_RESET  MPU6050_D0
+#define MPU6050_ACCEL_RESET MPU6050_D1
+#define MPU6050_GYRO_RESET  MPU6050_D2
+
+// MOT_DETECT_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_MOT_COUNT0      MPU6050_D0
+#define MPU6050_MOT_COUNT1      MPU6050_D1
+#define MPU6050_FF_COUNT0       MPU6050_D2
+#define MPU6050_FF_COUNT1       MPU6050_D3
+#define MPU6050_ACCEL_ON_DELAY0 MPU6050_D4
+#define MPU6050_ACCEL_ON_DELAY1 MPU6050_D5
+
+// Combined definitions for the MOT_COUNT
+#define MPU6050_MOT_COUNT_0 (0)
+#define MPU6050_MOT_COUNT_1 (bit(MPU6050_MOT_COUNT0))
+#define MPU6050_MOT_COUNT_2 (bit(MPU6050_MOT_COUNT1))
+#define MPU6050_MOT_COUNT_3 (bit(MPU6050_MOT_COUNT1)|bit(MPU6050_MOT_COUNT0))
+
+// Alternative names for the combined definitions
+#define MPU6050_MOT_COUNT_RESET MPU6050_MOT_COUNT_0
+
+// Combined definitions for the FF_COUNT
+#define MPU6050_FF_COUNT_0 (0)
+#define MPU6050_FF_COUNT_1 (bit(MPU6050_FF_COUNT0))
+#define MPU6050_FF_COUNT_2 (bit(MPU6050_FF_COUNT1))
+#define MPU6050_FF_COUNT_3 (bit(MPU6050_FF_COUNT1)|bit(MPU6050_FF_COUNT0))
+
+// Alternative names for the combined definitions
+#define MPU6050_FF_COUNT_RESET MPU6050_FF_COUNT_0
+
+// Combined definitions for the ACCEL_ON_DELAY
+#define MPU6050_ACCEL_ON_DELAY_0 (0)
+#define MPU6050_ACCEL_ON_DELAY_1 (bit(MPU6050_ACCEL_ON_DELAY0))
+#define MPU6050_ACCEL_ON_DELAY_2 (bit(MPU6050_ACCEL_ON_DELAY1))
+#define MPU6050_ACCEL_ON_DELAY_3 (bit(MPU6050_ACCEL_ON_DELAY1)|bit(MPU6050_ACCEL_ON_DELAY0))
+
+// Alternative names for the ACCEL_ON_DELAY
+#define MPU6050_ACCEL_ON_DELAY_0MS MPU6050_ACCEL_ON_DELAY_0
+#define MPU6050_ACCEL_ON_DELAY_1MS MPU6050_ACCEL_ON_DELAY_1
+#define MPU6050_ACCEL_ON_DELAY_2MS MPU6050_ACCEL_ON_DELAY_2
+#define MPU6050_ACCEL_ON_DELAY_3MS MPU6050_ACCEL_ON_DELAY_3
+
+// USER_CTRL Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_SIG_COND_RESET MPU6050_D0
+#define MPU6050_I2C_MST_RESET  MPU6050_D1
+#define MPU6050_FIFO_RESET     MPU6050_D2
+#define MPU6050_I2C_IF_DIS     MPU6050_D4   // must be 0 for MPU-6050
+#define MPU6050_I2C_MST_EN     MPU6050_D5
+#define MPU6050_FIFO_EN        MPU6050_D6
+
+// PWR_MGMT_1 Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_CLKSEL0      MPU6050_D0
+#define MPU6050_CLKSEL1      MPU6050_D1
+#define MPU6050_CLKSEL2      MPU6050_D2
+#define MPU6050_TEMP_DIS     MPU6050_D3    // 1: disable temperature sensor
+#define MPU6050_CYCLE        MPU6050_D5    // 1: sample and sleep
+#define MPU6050_SLEEP        MPU6050_D6    // 1: sleep mode
+#define MPU6050_DEVICE_RESET MPU6050_D7    // 1: reset to default values
+
+// Combined definitions for the CLKSEL
+#define MPU6050_CLKSEL_0 (0)
+#define MPU6050_CLKSEL_1 (bit(MPU6050_CLKSEL0))
+#define MPU6050_CLKSEL_2 (bit(MPU6050_CLKSEL1))
+#define MPU6050_CLKSEL_3 (bit(MPU6050_CLKSEL1)|bit(MPU6050_CLKSEL0))
+#define MPU6050_CLKSEL_4 (bit(MPU6050_CLKSEL2))
+#define MPU6050_CLKSEL_5 (bit(MPU6050_CLKSEL2)|bit(MPU6050_CLKSEL0))
+#define MPU6050_CLKSEL_6 (bit(MPU6050_CLKSEL2)|bit(MPU6050_CLKSEL1))
+#define MPU6050_CLKSEL_7 (bit(MPU6050_CLKSEL2)|bit(MPU6050_CLKSEL1)|bit(MPU6050_CLKSEL0))
+
+// Alternative names for the combined definitions
+#define MPU6050_CLKSEL_INTERNAL    MPU6050_CLKSEL_0
+#define MPU6050_CLKSEL_X           MPU6050_CLKSEL_1
+#define MPU6050_CLKSEL_Y           MPU6050_CLKSEL_2
+#define MPU6050_CLKSEL_Z           MPU6050_CLKSEL_3
+#define MPU6050_CLKSEL_EXT_32KHZ   MPU6050_CLKSEL_4
+#define MPU6050_CLKSEL_EXT_19_2MHZ MPU6050_CLKSEL_5
+#define MPU6050_CLKSEL_RESERVED    MPU6050_CLKSEL_6
+#define MPU6050_CLKSEL_STOP        MPU6050_CLKSEL_7
+
+// PWR_MGMT_2 Register
+// These are the names for the bits.
+// Use these only with the bit() macro.
+#define MPU6050_STBY_ZG       MPU6050_D0
+#define MPU6050_STBY_YG       MPU6050_D1
+#define MPU6050_STBY_XG       MPU6050_D2
+#define MPU6050_STBY_ZA       MPU6050_D3
+#define MPU6050_STBY_YA       MPU6050_D4
+#define MPU6050_STBY_XA       MPU6050_D5
+#define MPU6050_LP_WAKE_CTRL0 MPU6050_D6
+#define MPU6050_LP_WAKE_CTRL1 MPU6050_D7
+
+// Combined definitions for the LP_WAKE_CTRL
+#define MPU6050_LP_WAKE_CTRL_0 (0)
+#define MPU6050_LP_WAKE_CTRL_1 (bit(MPU6050_LP_WAKE_CTRL0))
+#define MPU6050_LP_WAKE_CTRL_2 (bit(MPU6050_LP_WAKE_CTRL1))
+#define MPU6050_LP_WAKE_CTRL_3 (bit(MPU6050_LP_WAKE_CTRL1)|bit(MPU6050_LP_WAKE_CTRL0))
+
+// Alternative names for the combined definitions
+// The names uses the Wake-up Frequency.
+#define MPU6050_LP_WAKE_1_25HZ MPU6050_LP_WAKE_CTRL_0
+#define MPU6050_LP_WAKE_2_5HZ  MPU6050_LP_WAKE_CTRL_1
+#define MPU6050_LP_WAKE_5HZ    MPU6050_LP_WAKE_CTRL_2
+#define MPU6050_LP_WAKE_10HZ   MPU6050_LP_WAKE_CTRL_3
+
+
+// Default I2C address for the MPU-6050 is 0x68.
+// But only if the AD0 pin is low.
+// Some sensor boards have AD0 high, and the
+// I2C address thus becomes 0x69.
+#define MPU6050_I2C_ADDRESS 0x68
+
+
+// Declaring an union for the registers and the axis values.
+// The byte order does not match the byte order of
+// the compiler and AVR chip.
+// The AVR chip (on the Arduino board) has the Low Byte
+// at the lower address.
+// But the MPU-6050 has a different order: High Byte at
+// lower address, so that has to be corrected.
+// The register part "reg" is only used internally,
+// and are swapped in code.
+typedef union accel_t_gyro_union
+{
+  struct
+  {
+    uint8_t x_accel_h;
+    uint8_t x_accel_l;
+    uint8_t y_accel_h;
+    uint8_t y_accel_l;
+    uint8_t z_accel_h;
+    uint8_t z_accel_l;
+    uint8_t t_h;
+    uint8_t t_l;
+    uint8_t x_gyro_h;
+    uint8_t x_gyro_l;
+    uint8_t y_gyro_h;
+    uint8_t y_gyro_l;
+    uint8_t z_gyro_h;
+    uint8_t z_gyro_l;
+  } reg;
+  struct
+  {
+    int16_t x_accel;
+    int16_t y_accel;
+    int16_t z_accel;
+    int16_t temperature;
+    int16_t x_gyro;
+    int16_t y_gyro;
+    int16_t z_gyro;
+  } value;
+};
+
+
+void setup() {  //INICIO VOID SETUP
+
+  ////Resetea la EEPROM la primera vez que la usamos
+  //EEPROM.setMemPool(0,512); //Establecemos inicio y tamaño de EEPROM de la tarjeta utilizada
+  //EEPROM.setMaxAllowedWrites(128); //Mínimo para que pueda hacerse el primer borrado completo
+  ////rellenamos de 0 los datos de EEPROM
+  ////Attiny85 tiene 512 Bytes de EEPROM; ajustar según el que uséis
+  //if (EEPROM.readLong(508)!=4011983) { //En ese punto, preferiblemente al final, guardo un valor para saber si ya la he reseteado
+  //  for(int i=0; i<500; i=i+4) { //Ajustar el valor según el tamaño de la (EEPROM)-8
+  //     EEPROM.update(i,0);
+  //      }
+  //  EEPROM.update(508,4011983); //Almacenamos un número indicativo de que ya se ha inicializado en la última posición
+  //  //Serial.println("Borrado de EEPROM terminado"); //sólo debería aparecer 1 vez
+  //}
+
+  //Líneas de configuración del WatchDog Timer
+  /*** Setup the WDT ***/
+
+  /* Clear the reset flag. */
+  MCUSR &= ~(1 << WDRF);
+
+  /* In order to change WDE or the prescaler, we need to
+     set WDCE (This will allow updates for 4 clock cycles).
+  */
+  WDTCSR |= (1 << WDCE) | (1 << WDE);
+
+  /* set new watchdog timeout prescaler value */
+  //WDP3 - WDP2 - WPD1 - WDP0 - time
+  // 0      0      0      0      16 ms
+  // 0      0      0      1      32 ms
+  // 0      0      1      0      64 ms
+  // 0      0      1      1      0.125 s
+  // 0      1      0      0      0.25 s
+  // 0      1      0      1      0.5 s
+  // 0      1      1      0      1.0 s
+  // 0      1      1      1      2.0 s
+  // 1      0      0      0      4.0 s
+  // 1      0      0      1      8.0 s
+
+  WDTCSR = 1 << WDP2 | 1 << WDP1; /* 1.0 seconds */
+  //WDTCSR = 1<<WDP2 | 1<<WDP1 | 1<<WDP0; /* 2.0 seconds */
+  //WDTCSR = 1<<WDP3; /* 4.0 seconds */
+  //WDTCSR = 1<<WDP0 | 1<<WDP3; /* 8.0 seconds */
+
+  /* Enable the WD interrupt (note no reset). */
+  WDTCSR |= _BV(WDIE);
+
+  //Definir pines
+  //You need not set pin mode for analogRead - though if you have set the pin to
+  //output and later want to read from it then you need to set pinMode(0,INPUT);
+  //where 0 is the physical pin number not the analog input number.
+  //pinMode(PIN, OUTPUT);
+  pinMode(relePIN, OUTPUT);
+  pinMode(ledPIN, OUTPUT);
+  pinMode(zumbPIN, OUTPUT);
+  pinMode(voltajePIN, INPUT);
+  //Pin para reactivar el motor (tendríamos que conectarlo a Tierra (GND) para activarlo)
+  pinMode(intPIN, INPUT);
+  digitalWrite(intPIN, HIGH); //Ponemos el pin en HIGH mediante su resistencia interna (pullup), evitando interferencias
+
+  digitalWrite(relePIN, HIGH); //Encendemos la bici al conectarlo
+
+  pixels.begin(); // This initializes the NeoPixel library.
+  //Encendemos los LEDs para indicar puesta en marcha y comprobar que los colores funcionan
+  //Eliminar esto si necesitamos más memoria para el programa
+  // pixels.Color convierte valores RGB, de 0,0,0 hasta 255,255,255; (verde, rojo, azul)
+  pixels.setPixelColor(0, pixels.Color(0, 150, 0)); //Encendemos rojo
+  pixels.show(); // Envía el color actualizado al hardware.
+  delay(200);
+  pixels.setPixelColor(0, pixels.Color(150, 0, 0));
+  pixels.show(); //Verde
+  delay(200);
+  pixels.setPixelColor(0, pixels.Color(0, 0, 150));
+  pixels.show(); //Azul
+  delay(200);
+  for (int x = 0; x < 1; x++) { //Hacemos parpadear todos dos veces
+    pixels.setPixelColor(0, pixels.Color(100, 100, 100)); //Blanco
+    pixels.show();
+    delay(300);
+    pixels.setPixelColor(0, pixels.Color(0, 0, 0)); //apagado
+    pixels.show();
+    delay(300);
+  }
+  //millisInicio=millis();
+
+
+  //********** Código siguiente para el MPU-6050
+  int error;
+  uint8_t c;
+
+  Serial.begin(9600);
+  Serial.println(F("InvenSense MPU-6050"));
+  Serial.println(F("June 2012"));
+
+  // Initialize the 'Wire' class for the I2C-bus.
+  Wire.begin();
+
+
+  // default at power-up:
+  //    Gyro at 250 degrees second
+  //    Acceleration at 2g
+  //    Clock source at internal 8MHz
+  //    The device is in sleep mode.
+  //
+
+  error = MPU6050_read (MPU6050_WHO_AM_I, &c, 1);
+  Serial.print(F("WHO_AM_I : "));
+  Serial.print(c, HEX);
+  Serial.print(F(", error = "));
+  Serial.println(error, DEC);
+
+  // According to the datasheet, the 'sleep' bit
+  // should read a '1'.
+  // That bit has to be cleared, since the sensor
+  // is in sleep mode at power-up.
+  error = MPU6050_read (MPU6050_PWR_MGMT_1, &c, 1);
+  Serial.print(F("PWR_MGMT_1 : "));
+  Serial.print(c, HEX);
+  Serial.print(F(", error = "));
+  Serial.println(error, DEC);
+  Serial.println("Ringmaster 2016");
+  Serial.println("Iniciamos programa");
+
+} //FINAL VOID SETUP
+
+
+void loop() { //INICIO LOOP PRINCIPAL ***********************
+  
+  lee_MPU6050(); //Coge los datos de aceleración del MPU-6050
+  
+  value = doubleMap(analogRead(voltajePIN), 0, 1023, 0, 5) + ajusteVolt; //Cogemos un valor inicial del voltaje
+
+  //Comprobamos si la bici está en movimiento
+  if (accelX > (accelXAnt + sensibilidadAccel) or accelY > (accelYAnt + sensibilidadAccel) or accelZ > (accelZAnt + sensibilidadAccel)) {
+    movimiento=true;
+    contador=0; //Contador para la cuenta atrás de tiempo para apagarlo
+  }
+  else {
+    contador++;
+    movimiento=false;
+  }
+
+  //DEBUG
+  //    Serial.print("Alarma en: ");
+  //    if (accelX>accelXAnt+sensibilidadAccel) {
+  //      Serial.println("X");
+  //    }
+  //    if (accelY>accelYAnt+sensibilidadAccel) {
+  //      Serial.println("Y");
+  //    }
+  //    if (accelZ>accelZAnt+sensibilidadAccel) {
+  //      Serial.println("Z");
+  //    }
+  //    Serial.print(F("accel x,y,z: "));
+  //    Serial.print(accelX, DEC);
+  //    Serial.print(F(", "));
+  //    Serial.print(accelY, DEC);
+  //    Serial.print(F(", "));
+  //    Serial.print(accelZ, DEC);
+  //    Serial.println(F(""));
+  //    Serial.println(esperaAlarma);
+ 
+  //Guardamos valores anteriores
+  accelXAnt = accelX;
+  accelYAnt = accelY;
+  accelZAnt = accelZ;
+
+  
+  //Para velocidad de respuesta; si se detecta activación manual del interruptor, apagamos LED indicador y desconectamos relé
+  //El resto del código se ejecutará 1 vez cada 1 segundos.
+  //for(int x=1; x<5; x++) {
+  if (digitalRead(intPIN) == LOW and encendido == true) {
+    apagaTodo();
+  }
+  else if (digitalRead(intPIN) == LOW and encendido == false) { //Encendemos bici; si está baja de batería se indicará con la luz/panel
+      enciendeTodo();
+  }
+
+  if (encendido == true) {
+    //Recoge 3 muestras para sacar medias; el condensador se encarga de mantener un valor fijo
+    //Serial.println("Leemos valores");
+    for (int x = 0; x < 3; x++) {
+      //coge el voltaje en milivoltios, pasamos a voltios con la rutina doubleMap ahorrando memoria
+      voltaje[x] = doubleMap(analogRead(voltajePIN), 0, 1023, 0, 5); //Pasamos los valores de entre 0 a 1023 a valores entre 0 y 5V
+      delay(15); // espera entre lecturas
+    }
+    //Ordenamos para descartar bajo y alto
+    for (int x = 0; x < 3; x++) {
+      for (int y = 0; y < 3; y++) {
+        if (voltaje[y] < voltaje[y + 1]) {
+          value = voltaje[y];
+          voltaje[y] = voltaje[y + 1];
+          voltaje[y + 1] = value;
+        }
+      }
+    }
+
+    //Obtenemos voltaje
+    value = (double)voltaje[1];
+    value = int(value * 100); //Trabajamos con sólo dos decimales (no merece la pena más exactitud)
+    value = value / 100;
+    value = value + ajusteVolt;
+
+    Serial.print("Voltaje=");
+    Serial.println(value);
+    //delay(200);
+
+    //Aquí se evalúa el color del led según los valores del voltaje, para evitar que fluctúe se tiene en cuenta
+    //qué color tenía antes, y no cambia hasta que haya una variación mayor de 0,02V
+    if (value <= mVoltCarga[2] and value > mVoltCarga[1]) { //ROJO; Recargar lo antes posible
+      //Si el color no estaba establecido o era el mismo o ha variado suficientemente el voltaje
+      if (color == 0  or color == 1 or (color == 2 and value <= mVoltCarga[2] - 0.02)) {
+        color = 1;
+        pixels.setPixelColor(0, pixels.Color(0, luminLED, 0));
+      }
+    }
+    else if (value <= mVoltCarga[3] && value > mVoltCarga[2]) { //NARANJA; se parece más al rojo
+      if (color == 0  or color == 2 or (color == 3 and value <= mVoltCarga[3] - 0.02) or (color == 1 and value > mVoltCarga[2] + 0.02) ) {
+        color = 2;
+        pixels.setPixelColor(0, pixels.Color(luminLED * 0.3, luminLED * 0.7, luminLED * 0.1)); //Entre el 20 y el 30%; momento de recargar la batería
+      }
+    }
+    else if (value <= mVoltCarga[4] && value > mVoltCarga[3]) { //AMARILLO color 3
+      if (color == 0  or color == 3 or (color == 4 and value <= mVoltCarga[4] - 0.02) or (color == 2 and value > mVoltCarga[3] + 0.02) ) {
+        color = 3;
+        pixels.setPixelColor(0, pixels.Color(luminLED * 0.4, luminLED * 0.5, 0)); //Aconsejable recargar batería
+      }
+    }
+    else if (value <= mVoltCarga[5] && value > mVoltCarga[4]) { //VERDE color 4
+      if (color == 0  or color == 4 or (color == 5 and value <= mVoltCarga[5] - 0.02) or (color == 3 and value > mVoltCarga[4] + 0.02) ) {
+        color = 4;
+        pixels.setPixelColor(0, pixels.Color(luminLED * 0.5, 0, 0)); //Le bajo la intensidad todavía más; al fin y al cabo, siempre estará encendido
+      }
+    }
+    else if (value <= mVoltCarga[6] && value > mVoltCarga[5]) { //AZUL color 5
+      if (color == 0 or color == 5 or (color == 6 and value <= mVoltCarga[6] - 0.02) or (color == 4 and value > mVoltCarga[5] + 0.02) ) {
+        color = 5;
+        pixels.setPixelColor(0, pixels.Color(0, 0, luminLED)); //Se ha sobrecargado; recomendable no llegar al azul para maximizar vida útil
+      }
+    }
+    else  if (value > mVoltCarga[6]) { //>100% VIOLETA 6
+      color = 6;
+      pixels.setPixelColor(0, pixels.Color(0, luminLED * 0.6, luminLED * 0.75)); //Por encima de lo recomendado; PELIGROSO
+    }
+    pixels.show(); //Actualizamos el color del led
+
+    //DEBUG
+    Serial.print("Contador=");
+    Serial.println(contador);
+    delay(100);
+
+    //Si detectamos que la bici no se usa durante el tiempo indicado, apagamos todo, hasta que no se pulse en interruptor del P2 no vuelve a continuar
+    if (contador > (minutos * 60)) { //Al hacer tres comprobaciones dentro del tiempo marcado, nos aseguramos
+      //Ha pasado el tiempo sin uso; apagamos todo
+      apagaTodo();
+    }
+
+  } //**** FIN IF ENCENDIDO  ********************
+  else { //Está en modo bajo consumo, led APAGADO
+      //Comprobamos si hay movimiento
+      if (esperaAlarma>0) { //Descontamos tiempo de espera
+        esperaAlarma--;
+       }
+
+    //Comprobamos la aceleración comparando con datos anteriores; si se superan en sensibilidadAccel, alquien lo está manipulando
+    if (movimiento==true) {
+      if (esperaAlarma>0) { //Mientras no pase el tiempo de reposo, ignoramos el movimiento
+        esperaAlarma=tiempoEspera;
+      }
+      else {
+        alarmaAct++;
+        pixels.setPixelColor(0, pixels.Color(0, luminLED, 0));
+        pixels.show();
+        if (alarmaAct > 2 and alarmaAct <= 6) {
+          digitalWrite(relePIN, HIGH); 
+          for (int x = 0; x < (alarmaAct * 3); x++) { //Intermitencia de zumbador
+            digitalWrite(zumbPIN, HIGH);
+            delay(100);
+            digitalWrite(zumbPIN, LOW);
+            delay(140);
+            if (x>1) {
+              digitalWrite(relePIN, LOW); //Activamos sólo por 0,5 Segundos el relé y luces
+            }
+          }
+        }
+      }
+    }
+
+    if (alarmaAct > 6) { //Estando la alarma activada se desactiva la espera final, por lo que es constante la alarma
+      alarmaAct++;
+      digitalWrite(relePIN, HIGH);  //Enciende relé y con ello luces
+      for (int x = 0; x < 10; x++) { //Hace sólo 10 veces esta operación, dejando quitar la alarma con el botón
+        if (x>4) {
+          digitalWrite(relePIN, LOW); //Apaga tras 0,6 segundos (respuesta lenta del foco, hacemos parpadear)
+        }
+        digitalWrite(zumbPIN, HIGH);
+        digitalWrite(relePIN, HIGH); //Encendemos todo intermitentemente
+        pixels.setPixelColor(0, pixels.Color(0, luminLED, 0));
+        pixels.show();
+        delay(50);
+        digitalWrite(zumbPIN, LOW);
+        pixels.setPixelColor(0, pixels.Color(0, 0, 0));
+        pixels.show();
+        digitalWrite(relePIN, LOW); 
+        delay(60);
+      }
+      if (alarmaAct > 200) { //Para la alarma
+        alarmaAct = 0;
+      }
+    }
+    
+    if (alarmaAct==0) { //No hay movimiento, apagamos LED
+      pixels.setPixelColor(0, pixels.Color(0, 0, 0));
+      pixels.show();
+    }
+} //Aquí termina el caso en que esté apagado  *******************
+
+  //Lo siguiente se ejecuta en todos los casos
+
+  //Si alcanza un valor donde es necesaria la recarga, avisamos parpadeando la batería
+  if (value < mVoltCarga[1] and value>2 and encendido==true) { //Avisamos del estado de baja batería
+    parpadeaRojo();
+  }
+  //si la batería baja demasiado, avisamos con un pitido breve y parpadeo del led rojo de que urge la carga
+  //En cualquier caso, si alguna de las celdas baja de 2,75V, el control de carga corta la alimentación de todo
+  if (value < mVoltCarga[0] and alarmaAct==0) { 
+    if (encendido == false) { //No me interesa que pite mientras ando en la bici
+      for (int x = 0; x < 2; x++) {
+        digitalWrite(zumbPIN, HIGH);
+        delay(150);
+        digitalWrite(zumbPIN, LOW);
+        delay(150);
+      }
+     parpadeaRojo();
+   }
+  }
+
+  //Utilizo la EEPROM para valores estadísticos únicamente; se puede eliminar si se considera
+  /* DATOS GUARDADOS EN EEPROM *PENDIENTE DE HACER
+      0: Horas funcionamiento Arduino
+      3: Último voltaje Arduino, para controlar el número de recargas
+      7: Contador de recargas de baterías
+      11: Contador de viajes/encendidos
+      15: Voltaje máximo histórico
+      19: Voltaje mínimo histórico
+      23:
+      27:
+      31:
+
+  */
+
+  ////Guardamos las horas de uso en la EEPROM
+  //if ((millis()-millisInicio)>3600000) { //Ha pasado una hora
+  //  millisInicio=millis();
+  //  EEPROM.update(0,EEPROM.readLong(0)+1); //Añadimos una hora al contador
+  //  }
+  ////Comprobamos valor mínimo y actualizamos
+  //if (EEPROM.readLong(19)>value)  {
+  //  EEPROM.update(19,value);
+  //}
+  ////Comprobamos valor máximo y actualizamos
+  //if (EEPROM.readLong(15)<value) {
+  //  EEPROM.update(15,value);
+  //}
+  
+  //Si pasa rato sin que la bici se mueva, se resetea contador de movimientos
+  if (alarmaAct > 0 and alarmaAct < 7) {
+    contAlarma--;
+    if (contAlarma == 0) {
+      alarmaAct = 0;
+      contAlarma = resetAlarmaSeg;
+    }
+  }
+  if (alarmaAct < 7) { //Para dar velocidad de respuesta
+    enterSleep(); //Ahorramos batería ya que está el 99% del tiempo "dormido"
+  }
+}//THEEND FIN DE CÓDIGO ***********************************
+
+void parpadeaRojo() { //Rutina de aviso de baja batería, led ROJO intermitente rápido
+ if (parpadea == false) {
+      pixels.setPixelColor(0, pixels.Color(0, luminLED, 0)); //color rojo
+      pixels.show();
+      parpadea = true;
+      }
+      else {
+        pixels.setPixelColor(0, pixels.Color(0, 0, 0)); //apagado
+        pixels.show();
+        parpadea = false;
+      }
+}
+
+void apagaTodo() { //Aquí desconectamos todo para ahorrar energía (durante 1 segundo)
+  //Prefiero conectar el interruptor entre el PIN y Tierra, con una resistencia que mantenga el pin en HIGH de 10K
+  //Ya que por ejemplo en el P3, hay una resistencia pull-up y la resistencia externa podría no ser suficiente para ponerlo en LOW
+  //pero si lo conectamos a Tierra, no habrá duda de que lo ponemos en LOW.
+  //Hay que tener en cuenta que sólo dormimos la cpu, pero todos los pines quedan con las salidas preestablecidas
+  digitalWrite(relePIN, LOW); //apagamos todo y ponemos al attiny a dormir
+  pixels.setPixelColor(0, pixels.Color(0, 0, 0)); //Apagamos LED, ya que es independiente; sigue gastando algo, pero menos
+  pixels.show(); //Actualizamos
+  encendido = false;
+  esperaAlarma = tiempoEspera; //Reseteamos tiempo
+  alarmaAct = -1; //Dar margen a dejar la bici aparcada
+  // Encendemos el MPU-6050 para activar alarma en caso de movimiento extraño
+  MPU6050_write_reg (MPU6050_PWR_MGMT_1, 0);
+  delay(400); //Damos tiempo a soltar el interruptor
+}
+
+void enciendeTodo() { //Aquí conectamos todo lo que nos interese
+  //Prefiero conectar el interruptor entre el PIN y Tierra, con una resistencia que mantenga el pin en HIGH de 10K
+  //Ya que por ejemplo en el P3, hay una resistencia pull-up y la resistencia externa podría no ser suficiente para ponerlo en LOW
+  //pero si lo conectamos a Tierra, no habrá duda de que lo ponemos en LOW.
+  //Hay que tener en cuenta que sólo dormimos la cpu, pero todos los pines quedan con las salidas preestablecidas
+  digitalWrite(relePIN, HIGH); //apagamos todo y ponemos al attiny a dormir
+  // Apagamos también el MPU-6050.
+  MPU6050_write_reg (MPU6050_PWR_MGMT_1, 1);
+  encendido = true;
+  contador = 0;
+  alarmaAct = 0; //Anulamos alarma
+  delay(400); //Damos tiempo a soltar el interruptor
+}
+
+
+//RUTINA MAPEO DOBLE
+double doubleMap(double x, double in_min, double in_max, double out_min, double out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+
+// *************** RUTINAS LECTURA VOLTAJE ***************
+//Code from http://donalmorrissey.blogspot.com.es/2010/04/sleeping-arduino-part-5-wake-up-via.html
+/***************************************************
+    Name:        ISR(WDT_vect)
+
+    Returns:     Nothing.
+
+    Parameters:  None.
+
+    Description: Watchdog Interrupt Service. This
+                 is executed when watchdog timed out.
+
+ ***************************************************/
+ISR(WDT_vect)
+{
+  //Aquí el código que queremos se ejecute cuando el watchdog "despierta" al procesador
+
+}
+
+
+
+/***************************************************
+    Name:        enterSleep
+
+    Returns:     Nothing.
+
+    Parameters:  None.
+
+    Description: Enters the arduino into sleep mode.
+
+ ***************************************************/
+void enterSleep(void)
+{
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);   /* EDIT: could also use SLEEP_MODE_PWR_SAVE for less power consumption. */
+  sleep_enable();
+
+  /* Now enter sleep mode. */
+  // Apagamos también el MPU-6050.
+  MPU6050_write_reg (MPU6050_PWR_MGMT_1, 1);
+  sleep_mode();
+
+  /* The program will continue from here after the WDT timeout*/
+  sleep_disable(); /* First thing to do is disable sleep. */
+
+  /* Re-enable the peripherals. */
+  power_all_enable();
+  // Encendemos también el MPU-6050.
+  MPU6050_write_reg (MPU6050_PWR_MGMT_1, 0);
+}
+
+
+
+// RUTINAS DE USO DEL MPU 6050 *************************
+// --------------------------------------------------------
+// MPU6050_read
+//
+// This is a common function to read multiple bytes
+// from an I2C device.
+//
+// It uses the boolean parameter for Wire.endTransMission()
+// to be able to hold or release the I2C-bus.
+// This is implemented in Arduino 1.0.1.
+//
+// Only this function is used to read.
+// There is no function for a single byte.
+//
+int MPU6050_read(int start, uint8_t *buffer, int size)
+{
+  int i, n, error;
+
+  Wire.beginTransmission(MPU6050_I2C_ADDRESS);
+  n = Wire.write(start);
+  if (n != 1)
+    return (-10);
+
+  n = Wire.endTransmission(false);    // hold the I2C-bus
+  if (n != 0)
+    return (n);
+
+  // Third parameter is true: relase I2C-bus after data is read.
+  Wire.requestFrom(MPU6050_I2C_ADDRESS, size, true);
+  i = 0;
+  while (Wire.available() && i < size)
+  {
+    buffer[i++] = Wire.read();
+  }
+  if ( i != size)
+    return (-11);
+
+  return (0);  // return : no error
+}
+
+
+// --------------------------------------------------------
+// MPU6050_write
+//
+// This is a common function to write multiple bytes to an I2C device.
+//
+// If only a single register is written,
+// use the function MPU_6050_write_reg().
+//
+// Parameters:
+//   start : Start address, use a define for the register
+//   pData : A pointer to the data to write.
+//   size  : The number of bytes to write.
+//
+// If only a single register is written, a pointer
+// to the data has to be used, and the size is
+// a single byte:
+//   int data = 0;        // the data to write
+//   MPU6050_write (MPU6050_PWR_MGMT_1, &c, 1);
+//
+int MPU6050_write(int start, const uint8_t *pData, int size)
+{
+  int n, error;
+
+  Wire.beginTransmission(MPU6050_I2C_ADDRESS);
+  n = Wire.write(start);        // write the start address
+  if (n != 1)
+    return (-20);
+
+  n = Wire.write(pData, size);  // write data bytes
+  if (n != size)
+    return (-21);
+
+  error = Wire.endTransmission(true); // release the I2C-bus
+  if (error != 0)
+    return (error);
+
+  return (0);         // return : no error
+}
+
+// --------------------------------------------------------
+// MPU6050_write_reg
+//
+// An extra function to write a single register.
+// It is just a wrapper around the MPU_6050_write()
+// function, and it is only a convenient function
+// to make it easier to write a single register.
+//
 int MPU6050_write_reg(int reg, uint8_t data) {
   int error;
 
